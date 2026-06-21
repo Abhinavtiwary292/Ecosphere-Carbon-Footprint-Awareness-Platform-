@@ -2,24 +2,304 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from datetime import datetime, timezone
+import sqlite3
 import os
-import sys
 
-# Ensure project root is in the path
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# --------------------------------------------------------------------------
+# Database Manager (SQLite Local Instance)
+# --------------------------------------------------------------------------
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ecosphere.db")
 
-from backend.calculator import calculate_footprint, ELECTRICITY_REGION_FACTORS
-from backend.database import init_db, save_entry, get_entries, delete_entry, clear_history
-from backend.recommender import get_recommendations
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# Initialize SQLite database
+def init_db():
+    """
+    Initializes the SQLite database and creates the footprint_history table if it doesn't exist.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS footprint_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            car_distance REAL NOT NULL,
+            car_fuel_type TEXT NOT NULL,
+            transit_distance REAL NOT NULL,
+            short_flights INTEGER NOT NULL,
+            long_flights INTEGER NOT NULL,
+            electricity_usage REAL NOT NULL,
+            heating_type TEXT NOT NULL,
+            household_size INTEGER NOT NULL,
+            diet_type TEXT NOT NULL,
+            shopping_habits TEXT NOT NULL,
+            recycling_habit TEXT NOT NULL,
+            
+            -- Calculated Emission Metrics (stored in kg CO2e)
+            transport_emissions REAL NOT NULL,
+            home_emissions REAL NOT NULL,
+            diet_emissions REAL NOT NULL,
+            goods_emissions REAL NOT NULL,
+            total_emissions REAL NOT NULL,
+            simulated_savings REAL NOT NULL,
+            simulated_total REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_entry(data) -> int:
+    """
+    Saves a footprint history entry into the database.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    timestamp = data.get("timestamp", datetime.now(timezone.utc).isoformat())
+    
+    cursor.execute("""
+        INSERT INTO footprint_history (
+            timestamp, car_distance, car_fuel_type, transit_distance, 
+            short_flights, long_flights, electricity_usage, heating_type, 
+            household_size, diet_type, shopping_habits, recycling_habit,
+            transport_emissions, home_emissions, diet_emissions, goods_emissions,
+            total_emissions, simulated_savings, simulated_total
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        timestamp,
+        float(data.get("car_distance", 0)),
+        data.get("car_fuel_type", "Petrol"),
+        float(data.get("transit_distance", 0)),
+        int(data.get("short_flights", 0)),
+        int(data.get("long_flights", 0)),
+        float(data.get("electricity_usage", 0)),
+        data.get("heating_type", "Natural gas"),
+        int(data.get("household_size", 1)),
+        data.get("diet_type", "Average (omnivore)"),
+        data.get("shopping_habits", "Average"),
+        data.get("recycling_habit", "Sometimes"),
+        float(data.get("transport_emissions", 0)),
+        float(data.get("home_emissions", 0)),
+        float(data.get("diet_emissions", 0)),
+        float(data.get("goods_emissions", 0)),
+        float(data.get("total_emissions", 0)),
+        float(data.get("simulated_savings", 0)),
+        float(data.get("simulated_total", 0))
+    ))
+    
+    conn.commit()
+    inserted_id = cursor.lastrowid
+    conn.close()
+    return inserted_id
+
+def get_entries(limit: int = 15):
+    """
+    Retrieves history logs from the database, sorted descending by timestamp.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM footprint_history ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def delete_entry(entry_id: int) -> bool:
+    """
+    Deletes a specific history record by ID.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM footprint_history WHERE id = ?", (entry_id,))
+    conn.commit()
+    rows_affected = cursor.rowcount
+    conn.close()
+    return rows_affected > 0
+
+def clear_history() -> bool:
+    """
+    Deletes all history records from the database.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM footprint_history")
+    conn.commit()
+    conn.close()
+    return True
+
+# --------------------------------------------------------------------------
+# Calculator Engine (EPA / GHG Protocol Conversion Factors)
+# --------------------------------------------------------------------------
+FUEL_FACTORS = {
+    "Petrol": 0.192,
+    "Diesel": 0.171,
+    "Hybrid": 0.106,
+    "Electric": 0.053,
+    "None": 0.0
+}
+PUBLIC_TRANSIT_FACTOR = 0.082
+SHORT_FLIGHT_KG = 220.0
+LONG_FLIGHT_KG = 1050.0
+
+ELECTRICITY_REGION_FACTORS = {
+    "Global Average": 0.40,
+    "United States": 0.36,
+    "European Union": 0.22,
+    "India": 0.72,
+    "United Kingdom": 0.18,
+    "Canada": 0.08
+}
+
+HEATING_FACTORS = {
+    "Natural gas": 0.182,
+    "Electric": 0.380,
+    "Oil": 0.265,
+    "Renewable / none": 0.030
+}
+
+DIET_FACTORS = {
+    "Meat heavy": 3200.0,
+    "Average (omnivore)": 2400.0,
+    "Vegetarian": 1600.0,
+    "Vegan": 1300.0
+}
+
+SHOPPING_FACTORS = {
+    "Low": 350.0,
+    "Average": 850.0,
+    "High": 1500.0
+}
+
+RECYCLING_MODIFIERS = {
+    "Rarely": 180.0,
+    "Sometimes": 0.0,
+    "Always": -140.0
+}
+
+def calculate_footprint(inputs, region="Global Average"):
+    """
+    Computes carbon footprint in kg CO2e per year based on deterministic EPA and GHG protocol equations.
+    """
+    car_dist = float(inputs.get("car_distance", 0) or 0)
+    fuel_type = inputs.get("car_fuel_type", "Petrol")
+    fuel_factor = FUEL_FACTORS.get(fuel_type, FUEL_FACTORS["Petrol"])
+    
+    transit_dist = float(inputs.get("transit_distance", 0) or 0)
+    short_flights = int(inputs.get("short_flights", 0) or 0)
+    long_flights = int(inputs.get("long_flights", 0) or 0)
+    
+    transport_kg = (
+        (car_dist * 52.0 * fuel_factor) +
+        (transit_dist * 52.0 * PUBLIC_TRANSIT_FACTOR) +
+        (short_flights * SHORT_FLIGHT_KG) +
+        (long_flights * LONG_FLIGHT_KG)
+    )
+    
+    elec_usage = float(inputs.get("electricity_usage", 0) or 0)
+    grid_factor = ELECTRICITY_REGION_FACTORS.get(region, 0.40)
+    
+    heating_type = inputs.get("heating_type", "Natural gas")
+    heating_factor = HEATING_FACTORS.get(heating_type, 0.182)
+    household_size = max(1, int(inputs.get("household_size", 1) or 1))
+    
+    base_heating_kwh = 8000.0
+    home_energy_kg = ((elec_usage * 12.0 * grid_factor) + (base_heating_kwh * heating_factor)) / household_size
+    
+    diet_type = inputs.get("diet_type", "Average (omnivore)")
+    diet_kg = DIET_FACTORS.get(diet_type, 2400.0)
+    
+    shopping = inputs.get("shopping_habits", "Average")
+    shopping_base = SHOPPING_FACTORS.get(shopping, 850.0)
+    
+    recycling = inputs.get("recycling_habit", "Sometimes")
+    recycling_mod = RECYCLING_MODIFIERS.get(recycling, 0.0)
+    goods_waste_kg = shopping_base + recycling_mod
+    
+    total_kg = transport_kg + home_energy_kg + diet_kg + goods_waste_kg
+    
+    return {
+        "transportKg": round(transport_kg),
+        "homeKg": round(home_energy_kg),
+        "dietKg": round(diet_kg),
+        "goodsKg": round(goods_waste_kg),
+        "totalKg": round(total_kg)
+    }
+
+# --------------------------------------------------------------------------
+# Recommender Engine (AI Mitigation Heuristics)
+# --------------------------------------------------------------------------
+def get_recommendations(breakdown, inputs):
+    """
+    Analyzes user inputs and footprint breakdown to produce personalized carbon-mitigation recommendations.
+    """
+    actions = []
+    transport_kg = breakdown.get("transportKg", 0)
+    home_kg = breakdown.get("homeKg", 0)
+    diet_kg = breakdown.get("dietKg", 0)
+    goods_kg = breakdown.get("goodsKg", 0)
+
+    car_dist = float(inputs.get("car_distance", 0) or 0)
+    if car_dist > 80:
+        actions.append({
+            "id": "action_car",
+            "category": "Transport",
+            "icon": "car",
+            "advice": "Switch to public transit, train, or cycling for short commutes.",
+            "saving": round(transport_kg * 0.25) or 300
+        })
+
+    long_flights = int(inputs.get("long_flights", 0) or 0)
+    short_flights = int(inputs.get("short_flights", 0) or 0)
+    if long_flights > 0 or short_flights > 1:
+        actions.append({
+            "id": "action_flight",
+            "category": "Transport",
+            "icon": "plane",
+            "advice": "Consolidate long-distance travel, prioritize train corridors, or purchase verified carbon offsets.",
+            "saving": round((long_flights * 1050 + short_flights * 220) * 0.5) or 500
+        })
+
+    diet_type = inputs.get("diet_type", "Average (omnivore)")
+    if diet_type in ["Average (omnivore)", "Meat heavy"]:
+        saving_val = 450 if diet_type == "Meat heavy" else 350
+        actions.append({
+            "id": "action_diet",
+            "category": "Diet",
+            "icon": "utensils",
+            "advice": "Introduce one or two meat-free days per week by incorporating plant-based proteins.",
+            "saving": saving_val
+        })
+
+    heating_type = inputs.get("heating_type", "Natural gas")
+    if heating_type in ["Natural gas", "Oil"]:
+        actions.append({
+            "id": "action_heating",
+            "category": "Home energy",
+            "icon": "home",
+            "advice": "Lower the thermostat by 1-2°C, utilize smart schedules, and seal window draft zones.",
+            "saving": round(home_kg * 0.15) or 250
+        })
+
+    shopping = inputs.get("shopping_habits", "Average")
+    recycling = inputs.get("recycling_habit", "Sometimes")
+    if shopping == "High" or recycling == "Rarely":
+        actions.append({
+            "id": "action_goods",
+            "category": "Goods & waste",
+            "icon": "shopping-bag",
+            "advice": "Opt for circular/second-hand goods, reduce single-use products, and sort recyclables strictly.",
+            "saving": round(goods_kg * 0.25) or 200
+        })
+
+    actions.sort(key=lambda x: x["saving"], reverse=True)
+    return actions[:3]
+
+# --------------------------------------------------------------------------
+# Streamlit Front-End Web Setup
+# --------------------------------------------------------------------------
 init_db()
 
-# Constants
-TARGET_T = 2.0
-GLOBAL_AVG_T = 4.8
-
-# Set up Streamlit page configurations
+# Page configs
 st.set_page_config(
     page_title="Ecosphere — Carbon Footprint Platform",
     page_icon="🌍",
@@ -27,18 +307,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --------------------------------------------------------------------------
-# Custom CSS Styling (Glassmorphism & Dark Green Theme Adjustments)
-# --------------------------------------------------------------------------
+# Custom CSS Styles Injection (Dark Green Theme Guidelines)
 st.markdown("""
 <style>
-    /* Global Styles */
     .stApp {
         background-color: #060b09;
         color: #f3f4f6;
     }
-    
-    /* Header Area */
     .header-container {
         display: flex;
         align-items: center;
@@ -62,8 +337,6 @@ st.markdown("""
         align-items: center;
         justify-content: center;
     }
-    
-    /* Styled Glassmorphic Containers */
     .glass-card {
         background: rgba(12, 22, 18, 0.75);
         border: 1px solid rgba(16, 185, 129, 0.12);
@@ -73,8 +346,6 @@ st.markdown("""
         margin-bottom: 1.5rem;
         backdrop-filter: blur(16px);
     }
-    
-    /* Wizard Steps Progress indicators */
     .step-indicator {
         display: flex;
         justify-content: space-between;
@@ -102,8 +373,6 @@ st.markdown("""
         border-color: #10b981;
         color: #020503;
     }
-
-    /* Target Gauge Style */
     .gauge-bar-bg {
         background: rgba(255, 255, 255, 0.05);
         height: 10px;
@@ -123,8 +392,6 @@ st.markdown("""
         color: #9ca3af;
         font-weight: 600;
     }
-    
-    /* Table modifications */
     .category-table {
         width: 100%;
         border-collapse: collapse;
@@ -142,18 +409,12 @@ st.markdown("""
         font-size: 0.85rem;
         border-bottom: 1px dotted rgba(255, 255, 255, 0.03);
     }
-    
-    /* Recommendations Checklist Cards */
     .insight-card {
         background: rgba(255, 255, 255, 0.015);
         border: 1px solid rgba(16, 185, 129, 0.12);
         border-radius: 12px;
         padding: 1rem;
         margin-bottom: 0.8rem;
-        transition: all 0.2s;
-    }
-    .insight-card:hover {
-        border-color: rgba(16, 185, 129, 0.25);
     }
     .insight-badge {
         font-size: 0.65rem;
@@ -169,7 +430,6 @@ st.markdown("""
     .insight-badge.home-energy { background: rgba(59, 130, 246, 0.1); color: #60a5fa; }
     .insight-badge.diet { background: rgba(244, 63, 94, 0.1); color: #fb7185; }
     .insight-badge.goods-waste { background: rgba(245, 158, 11, 0.1); color: #fbbf24; }
-    
     .savings-label {
         font-size: 0.75rem;
         font-weight: 700;
@@ -182,13 +442,14 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------
-# Session State Initialization
-# --------------------------------------------------------------------------
+# Constants
+TARGET_T = 2.0
+GLOBAL_AVG_T = 4.8
+
+# Initialize state
 if "step" not in st.session_state:
     st.session_state.step = 1
 
-# Initialize inputs dictionary in session state if not existing
 if "inputs" not in st.session_state:
     st.session_state.inputs = {
         "car_distance": 150.0,
@@ -207,31 +468,13 @@ if "inputs" not in st.session_state:
 if "adopted_insights" not in st.session_state:
     st.session_state.adopted_insights = {}
 
-# --------------------------------------------------------------------------
-# Sidebar Configurations
-# --------------------------------------------------------------------------
+# Sidebar configurations
 st.sidebar.title("🌍 Config Panel")
-st.sidebar.markdown("Configure global settings below:")
-
-# 1. Electricity Grid Region Select
-region = st.sidebar.selectbox(
-    "Electricity Grid Region",
-    options=list(ELECTRICITY_REGION_FACTORS.keys()),
-    index=0
-)
-
-# 2. Distance Unit
-distance_unit = st.sidebar.radio(
-    "Distance Units",
-    options=["KM", "MILE"],
-    index=0,
-    horizontal=True
-)
+region = st.sidebar.selectbox("Electricity Grid Region", options=list(ELECTRICITY_REGION_FACTORS.keys()), index=0)
+distance_unit = st.sidebar.radio("Distance Units", options=["KM", "MILE"], index=0, horizontal=True)
 unit_key = distance_unit.lower()
 
-# --------------------------------------------------------------------------
-# Calculate current results (Executed reactively at the start of every render)
-# --------------------------------------------------------------------------
+# Calculate reactive data
 scaled_inputs = st.session_state.inputs.copy()
 if unit_key == "mi":
     scaled_inputs["car_distance"] = scaled_inputs["car_distance"] * 1.60934
@@ -251,9 +494,7 @@ for action in recommendations:
 simulated_total_kg = max(0, total_kg - simulated_savings_kg)
 simulated_total_t = simulated_total_kg / 1000.0
 
-# --------------------------------------------------------------------------
-# App Header
-# --------------------------------------------------------------------------
+# Render App Header
 st.markdown("""
 <div class="header-container">
     <div class="logo-badge">🌱</div>
@@ -264,17 +505,14 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------
-# Estimator Form Wizard Columns
-# --------------------------------------------------------------------------
+# App grid columns
 col_form, col_dash = st.columns([1.1, 1.0], gap="large")
 
 with col_form:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.subheader("Estimator Configurator")
-    st.markdown("Walk through the steps to configure your footprint metrics.")
+    st.markdown("Configure your emissions settings step-by-step.")
     
-    # Render wizard progress bar
     s1 = "active" if st.session_state.step == 1 else ("completed" if st.session_state.step > 1 else "")
     s2 = "active" if st.session_state.step == 2 else ("completed" if st.session_state.step > 2 else "")
     s3 = "active" if st.session_state.step == 3 else ("completed" if st.session_state.step > 3 else "")
@@ -289,142 +527,58 @@ with col_form:
     </div>
     """, unsafe_allow_html=True)
     
-    # --------------------------------------------------------
-    # STEP 1: TRANSPORT
-    # --------------------------------------------------------
     if st.session_state.step == 1:
-        st.markdown("<h4 style='color:#10b981; text-transform:uppercase; font-size:0.8rem; letter-spacing:0.05em;'>1. Transport Logistics</h4>", unsafe_allow_html=True)
-        
+        st.markdown("<h4 style='color:#10b981; text-transform:uppercase; font-size:0.8rem;'>1. Transport Logistics</h4>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
         with c1:
-            st.session_state.inputs["car_distance"] = st.number_input(
-                f"Car Driving / Week ({distance_unit})",
-                min_value=0.0,
-                value=float(st.session_state.inputs["car_distance"]),
-                step=10.0
-            )
+            st.session_state.inputs["car_distance"] = st.number_input(f"Car Driving / Week ({distance_unit})", min_value=0.0, value=float(st.session_state.inputs["car_distance"]), step=10.0)
         with c2:
-            st.session_state.inputs["car_fuel_type"] = st.selectbox(
-                "Fuel & Engine Model",
-                options=["Petrol", "Diesel", "Hybrid", "Electric", "None"],
-                index=["Petrol", "Diesel", "Hybrid", "Electric", "None"].index(st.session_state.inputs["car_fuel_type"])
-            )
-            
-        st.session_state.inputs["transit_distance"] = st.number_input(
-            f"Public Transit / Week ({distance_unit})",
-            min_value=0.0,
-            value=float(st.session_state.inputs["transit_distance"]),
-            step=10.0
-        )
-        
+            st.session_state.inputs["car_fuel_type"] = st.selectbox("Fuel & Engine Model", options=["Petrol", "Diesel", "Hybrid", "Electric", "None"], index=["Petrol", "Diesel", "Hybrid", "Electric", "None"].index(st.session_state.inputs["car_fuel_type"]))
+        st.session_state.inputs["transit_distance"] = st.number_input(f"Public Transit / Week ({distance_unit})", min_value=0.0, value=float(st.session_state.inputs["transit_distance"]), step=10.0)
         c3, c4 = st.columns(2)
         with c3:
-            st.session_state.inputs["short_flights"] = st.number_input(
-                "Short Flights / Year (< 1500 km)",
-                min_value=0,
-                value=int(st.session_state.inputs["short_flights"]),
-                step=1
-            )
+            st.session_state.inputs["short_flights"] = st.number_input("Short Flights / Year (< 1500 km)", min_value=0, value=int(st.session_state.inputs["short_flights"]), step=1)
         with c4:
-            st.session_state.inputs["long_flights"] = st.number_input(
-                "Long Flights / Year (>= 1500 km)",
-                min_value=0,
-                value=int(st.session_state.inputs["long_flights"]),
-                step=1
-            )
+            st.session_state.inputs["long_flights"] = st.number_input("Long Flights / Year (>= 1500 km)", min_value=0, value=int(st.session_state.inputs["long_flights"]), step=1)
             
-    # --------------------------------------------------------
-    # STEP 2: HOME ENERGY
-    # --------------------------------------------------------
     elif st.session_state.step == 2:
-        st.markdown("<h4 style='color:#3b82f6; text-transform:uppercase; font-size:0.8rem; letter-spacing:0.05em;'>2. Home Energy</h4>", unsafe_allow_html=True)
-        
-        st.session_state.inputs["electricity_usage"] = st.number_input(
-            "Monthly Electricity Usage (kWh)",
-            min_value=0.0,
-            value=float(st.session_state.inputs["electricity_usage"]),
-            step=50.0
-        )
-        
+        st.markdown("<h4 style='color:#3b82f6; text-transform:uppercase; font-size:0.8rem;'>2. Home Energy</h4>", unsafe_allow_html=True)
+        st.session_state.inputs["electricity_usage"] = st.number_input("Monthly Electricity Usage (kWh)", min_value=0.0, value=float(st.session_state.inputs["electricity_usage"]), step=50.0)
         c1, c2 = st.columns(2)
         with c1:
-            st.session_state.inputs["heating_type"] = st.selectbox(
-                "Primary Heating Fuel",
-                options=["Natural gas", "Electric", "Oil", "Renewable / none"],
-                index=["Natural gas", "Electric", "Oil", "Renewable / none"].index(st.session_state.inputs["heating_type"])
-            )
+            st.session_state.inputs["heating_type"] = st.selectbox("Primary Heating Fuel", options=["Natural gas", "Electric", "Oil", "Renewable / none"], index=["Natural gas", "Electric", "Oil", "Renewable / none"].index(st.session_state.inputs["heating_type"]))
         with c2:
-            st.session_state.inputs["household_size"] = st.number_input(
-                "Household size (Occupants)",
-                min_value=1,
-                value=int(st.session_state.inputs["household_size"]),
-                step=1
-            )
+            st.session_state.inputs["household_size"] = st.number_input("Household size (Occupants)", min_value=1, value=int(st.session_state.inputs["household_size"]), step=1)
 
-    # --------------------------------------------------------
-    # STEP 3: DIET
-    # --------------------------------------------------------
     elif st.session_state.step == 3:
-        st.markdown("<h4 style='color:#f43f5e; text-transform:uppercase; font-size:0.8rem; letter-spacing:0.05em;'>3. Dietary Footprint</h4>", unsafe_allow_html=True)
-        
-        st.write("Select your diet type:")
-        
+        st.markdown("<h4 style='color:#f43f5e; text-transform:uppercase; font-size:0.8rem;'>3. Dietary Footprint</h4>", unsafe_allow_html=True)
         diets = {
-            "Meat heavy": "🥩 Meat Lover - Red meat or poultry consumed daily",
-            "Average (omnivore)": "🥗 Omnivore - Balanced average mix of meat and plants",
-            "Vegetarian": "🧀 Vegetarian - No meat, but consumes dairy and eggs",
-            "Vegan": "🌱 Vegan - Purely plant-based nutrition, zero animal products"
+            "Meat heavy": "🥩 Meat Lover - Consumes daily meat",
+            "Average (omnivore)": "🥗 Omnivore - Balanced meat/plants",
+            "Vegetarian": "🧀 Vegetarian - No meat, consumes dairy",
+            "Vegan": "🌱 Vegan - Purely plant-based"
         }
-        
-        st.session_state.inputs["diet_type"] = st.radio(
-            "Diet Category",
-            options=list(diets.keys()),
-            format_func=lambda x: diets[x],
-            index=list(diets.keys()).index(st.session_state.inputs["diet_type"])
-        )
+        st.session_state.inputs["diet_type"] = st.radio("Diet Category", options=list(diets.keys()), format_func=lambda x: diets[x], index=list(diets.keys()).index(st.session_state.inputs["diet_type"]))
 
-    # --------------------------------------------------------
-    # STEP 4: GOODS & WASTE
-    # --------------------------------------------------------
     elif st.session_state.step == 4:
-        st.markdown("<h4 style='color:#f59e0b; text-transform:uppercase; font-size:0.8rem; letter-spacing:0.05em;'>4. Goods & Waste</h4>", unsafe_allow_html=True)
-        
-        st.session_state.inputs["shopping_habits"] = st.selectbox(
-            "Annual Consumption & Shopping",
-            options=["Low", "Average", "High"],
-            index=["Low", "Average", "High"].index(st.session_state.inputs["shopping_habits"])
-        )
-        
-        st.session_state.inputs["recycling_habit"] = st.selectbox(
-            "Recycling & Waste Habits",
-            options=["Always", "Sometimes", "Rarely"],
-            index=["Always", "Sometimes", "Rarely"].index(st.session_state.inputs["recycling_habit"])
-        )
+        st.markdown("<h4 style='color:#f59e0b; text-transform:uppercase; font-size:0.8rem;'>4. Goods & Waste</h4>", unsafe_allow_html=True)
+        st.session_state.inputs["shopping_habits"] = st.selectbox("Annual Shopping Consumption", options=["Low", "Average", "High"], index=["Low", "Average", "High"].index(st.session_state.inputs["shopping_habits"]))
+        st.session_state.inputs["recycling_habit"] = st.selectbox("Recycling Habits", options=["Always", "Sometimes", "Rarely"], index=["Always", "Sometimes", "Rarely"].index(st.session_state.inputs["recycling_habit"]))
 
-    # Wizard buttons row
     st.write("")
     nav_prev, nav_next, nav_save = st.columns([1, 1, 2])
-    
     with nav_prev:
         if st.button("⬅️ Back", disabled=(st.session_state.step == 1), use_container_width=True):
             st.session_state.step -= 1
             st.rerun()
-            
     with nav_next:
         if st.session_state.step < 4:
             if st.button("Next ➡️", use_container_width=True):
                 st.session_state.step += 1
                 st.rerun()
-                
     with nav_save:
         if st.session_state.step == 4:
             if st.button("💾 Save Entry to History", type="primary", use_container_width=True):
-                # Calculate dynamic savings applied
-                simulated_savings_kg = 0
-                for action in recommendations:
-                    if st.session_state.adopted_insights.get(action["id"], False):
-                        simulated_savings_kg += action["saving"]
-                        
                 payload = {
                     "car_distance": st.session_state.inputs["car_distance"],
                     "car_fuel_type": st.session_state.inputs["car_fuel_type"],
@@ -444,10 +598,10 @@ with col_form:
                     "goods_emissions": breakdown["goodsKg"],
                     "total_emissions": breakdown["totalKg"],
                     "simulated_savings": simulated_savings_kg,
-                    "simulated_total": max(0, breakdown["totalKg"] - simulated_savings_kg)
+                    "simulated_total": simulated_total_kg
                 }
                 save_entry(payload)
-                st.success("Footprint entry successfully saved to local SQLite database!")
+                st.success("Entry saved successfully!")
                 st.rerun()
                 
     st.write("")
@@ -468,19 +622,13 @@ with col_form:
         st.session_state.adopted_insights = {}
         st.session_state.step = 1
         st.rerun()
-        
     st.markdown('</div>', unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------
-# COLUMN 2: Analytical Dashboard
-# --------------------------------------------------------------------------
 with col_dash:
     st.markdown('<div class="glass-card">', unsafe_allow_html=True)
     st.subheader("Diagnostic Dashboard")
     
-    # Status level badge
-    level_label = ""
-    level_color = ""
+    level_label, level_color = "", ""
     if simulated_total_t < 2.0:
         level_label, level_color = "Climate Hero 🌟", "#10b981"
     elif simulated_total_t < 4.8:
@@ -493,29 +641,18 @@ with col_dash:
     st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem;">
         <span style="font-size:0.8rem; text-transform:uppercase; color:#9ca3af; font-weight:700;">Eco Level Rank</span>
-        <span style="background:rgba(255,255,255,0.02); color:{level_color}; border:1px solid {level_color}; border-radius:9999px; padding:0.35rem 0.85rem; font-size:0.75rem; font-weight:800; font-family:sans-serif; text-transform:uppercase;">
+        <span style="background:rgba(255,255,255,0.02); color:{level_color}; border:1px solid {level_color}; border-radius:9999px; padding:0.35rem 0.85rem; font-size:0.75rem; font-weight:800; text-transform:uppercase;">
             {level_label}
         </span>
     </div>
     """, unsafe_allow_html=True)
     
-    # Impact metrics columns
     m1, m2 = st.columns(2)
     with m1:
-        st.metric(
-            label="Current Annual Impact",
-            value=f"{total_t:.2f} t CO2e",
-            delta=f"{(total_t - TARGET_T):+.2f} t vs Target" if total_t > TARGET_T else "🌟 Under target limit",
-            delta_color="inverse"
-        )
+        st.metric(label="Current Annual Impact", value=f"{total_t:.2f} t CO2e", delta=f"{(total_t - TARGET_T):+.2f} t vs Target" if total_t > TARGET_T else "🌟 Under limit", delta_color="inverse")
     with m2:
-        st.metric(
-            label="Projected Footprint",
-            value=f"{simulated_total_t:.2f} t CO2e",
-            delta=f"-{simulated_savings_kg} kg savings applied" if simulated_savings_kg > 0 else "0 savings applied"
-        )
+        st.metric(label="Projected Footprint", value=f"{simulated_total_t:.2f} t CO2e", delta=f"-{simulated_savings_kg} kg savings applied" if simulated_savings_kg > 0 else "0 savings applied")
         
-    # Visual progress bar comparison
     fill_pct = min(100.0, (simulated_total_t / 10.0) * 100.0)
     gauge_bar_color = "#10b981" if simulated_total_t <= TARGET_T else ("#eab308" if simulated_total_t <= GLOBAL_AVG_T else "#ef4444")
     
@@ -532,17 +669,12 @@ with col_dash:
     """, unsafe_allow_html=True)
     
     st.write("")
-    
-    # Donut Breakdown and Table Section
     c_donut, c_table = st.columns([1, 1.2])
-    
     with c_donut:
-        # Altair Donut Chart
         source_df = pd.DataFrame({
             'Category': ['Transport', 'Home Energy', 'Diet', 'Goods & Waste'],
             'Value': [breakdown["transportKg"], breakdown["homeKg"], breakdown["dietKg"], breakdown["goodsKg"]]
         })
-        
         donut_chart = alt.Chart(source_df).mark_arc(innerRadius=45, outerRadius=65).encode(
             theta=alt.Theta(field="Value", type="quantitative"),
             color=alt.Color(field="Category", type="nominal", scale=alt.Scale(
@@ -551,16 +683,10 @@ with col_dash:
             ), legend=None),
             tooltip=['Category', alt.Tooltip('Value', title='Emissions (kg CO2e)')]
         ).properties(width=130, height=130).configure_view(strokeWidth=0)
-        
         st.altair_chart(donut_chart, use_container_width=True)
         
     with c_table:
         denom = total_kg if total_kg > 0 else 1
-        pct_t = (breakdown["transportKg"] / denom) * 100
-        pct_h = (breakdown["homeKg"] / denom) * 100
-        pct_d = (breakdown["dietKg"] / denom) * 100
-        pct_g = (breakdown["goodsKg"] / denom) * 100
-        
         st.markdown(f"""
         <table class="category-table">
             <thead>
@@ -574,32 +700,28 @@ with col_dash:
                 <tr>
                     <td><span style="color:#10b981">●</span> Transport</td>
                     <td style="text-align:right; font-family:monospace; font-weight:bold;">{breakdown["transportKg"]:,} kg</td>
-                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{pct_t:.0f}%</td>
+                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{(breakdown["transportKg"]/denom)*100:.0f}%</td>
                 </tr>
                 <tr>
                     <td><span style="color:#3b82f6">●</span> Home Energy</td>
                     <td style="text-align:right; font-family:monospace; font-weight:bold;">{breakdown["homeKg"]:,} kg</td>
-                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{pct_h:.0f}%</td>
+                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{(breakdown["homeKg"]/denom)*100:.0f}%</td>
                 </tr>
                 <tr>
                     <td><span style="color:#f43f5e">●</span> Diet</td>
                     <td style="text-align:right; font-family:monospace; font-weight:bold;">{breakdown["dietKg"]:,} kg</td>
-                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{pct_d:.0f}%</td>
+                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{(breakdown["dietKg"]/denom)*100:.0f}%</td>
                 </tr>
                 <tr>
                     <td><span style="color:#f59e0b">●</span> Goods & Waste</td>
                     <td style="text-align:right; font-family:monospace; font-weight:bold;">{breakdown["goodsKg"]:,} kg</td>
-                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{pct_g:.0f}%</td>
+                    <td style="text-align:right; font-family:monospace; color:#9ca3af;">{(breakdown["goodsKg"]/denom)*100:.0f}%</td>
                 </tr>
             </tbody>
         </table>
         """, unsafe_allow_html=True)
-        
     st.markdown('</div>', unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------
-# AI Insights / Mitigation Checklist
-# --------------------------------------------------------------------------
 st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 st.subheader("✨ Personalized Mitigation Strategies")
 st.markdown("Check items below to simulate implementation and see your footprint reduction in real time:")
@@ -612,24 +734,13 @@ else:
         cat_badge_class = action["category"].lower().replace(" & ", "-").replace(" ", "-")
         is_adopted_state = st.session_state.adopted_insights.get(act_id, False)
         
-        # Render a Streamlit checkbox inside the styled markup
         checkbox_key = f"chk_{act_id}"
-        
-        # Create column layouts for recommendations details
         cb_col, text_col = st.columns([0.08, 0.92], gap="small")
         with cb_col:
-            # Synchronize Streamlit checkbox state to session state
-            new_checked_state = st.checkbox(
-                label="Adopt mitigation",
-                value=is_adopted_state,
-                key=checkbox_key,
-                label_visibility="collapsed"
-            )
-            # Re-render triggered by change
+            new_checked_state = st.checkbox(label="Adopt mitigation", value=is_adopted_state, key=checkbox_key, label_visibility="collapsed")
             if new_checked_state != is_adopted_state:
                 st.session_state.adopted_insights[act_id] = new_checked_state
                 st.rerun()
-                
         with text_col:
             st.markdown(f"""
             <div style="margin-bottom:10px;">
@@ -640,9 +751,6 @@ else:
             """, unsafe_allow_html=True)
 st.markdown('</div>', unsafe_allow_html=True)
 
-# --------------------------------------------------------------------------
-# Ledger SQLite database logs & History
-# --------------------------------------------------------------------------
 st.markdown('<div class="glass-card">', unsafe_allow_html=True)
 st.subheader("📚 SQLite history ledger")
 
@@ -651,11 +759,9 @@ history_entries = get_entries(limit=15)
 if len(history_entries) == 0:
     st.info("No logs committed to local database ledger yet. Go to step 4 of the Estimator form to save logs.")
 else:
-    # 1. Plot historical trend line chart (if 2 or more logs exist)
     if len(history_entries) >= 2:
         st.markdown("<p style='font-size:0.75rem; text-transform:uppercase; color:#9ca3af; font-weight:700; letter-spacing:0.05em;'>Chronological Emissions trend line</p>", unsafe_allow_html=True)
         
-        # Format history data chronologically
         history_chart_data = []
         for idx, row in enumerate(reversed(history_entries)):
             dt = datetime.fromisoformat(row["timestamp"])
@@ -667,21 +773,16 @@ else:
             })
             
         chart_df = pd.DataFrame(history_chart_data)
-        
-        # Draw Altair Line chart
         line_chart = alt.Chart(chart_df).mark_line(color="#10b981", strokeWidth=2.5, point=alt.OverlayMarkDef(color="#10b981", size=60)).encode(
             x=alt.X('Date:N', sort=None, title='Save Log Timestamp'),
             y=alt.Y('Simulated Total:Q', title='Emissions (t CO2e)'),
             tooltip=['Date', alt.Tooltip('Simulated Total', format='.2f', title='Simulated (t)'), alt.Tooltip('Absolute Total', format='.2f', title='Original (t)')]
         ).properties(height=120)
         
-        # Horizontal line for 2t target
         target_rule = alt.Chart(pd.DataFrame({'y': [2.0]})).mark_rule(color="#10b981", strokeDash=[3,3]).encode(y='y:Q')
-        
         st.altair_chart(line_chart + target_rule, use_container_width=True)
         st.write("")
         
-    # 2. Render ledger records dataframe table
     formatted_logs = []
     for row in history_entries:
         dt = datetime.fromisoformat(row["timestamp"])
@@ -699,8 +800,6 @@ else:
         })
         
     st.dataframe(pd.DataFrame(formatted_logs), use_container_width=True, hide_index=True)
-    
-    # 3. Actions Row: Delete single log or clear ledger
     st.write("")
     c_del, c_clear = st.columns([1, 1])
     
